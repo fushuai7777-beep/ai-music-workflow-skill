@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+config.yaml
+projects/
+inputs/
+audio/
+final/
+logs/
+work/
+*.mp3
+*.wav

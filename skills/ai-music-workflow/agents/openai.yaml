@@ -1,4 +1,4 @@
 interface:
   display_name: "歌曲创作工作流"
-  short_description: "从已有歌词继续创作，核对 Suno 生成批次、人工听审和本地定稿归档"
-  default_prompt: "使用 $ai-music-workflow，首次先确认我的歌曲总项目文件夹，再核对本次项目和材料，推进创作、Suno 制作或听审归档；实际生成前确认本次授权。"
+  short_description: "创作与归档歌曲，按授权复用制作素材、追溯来源并审核经验草稿"
+  default_prompt: "使用 $ai-music-workflow，先确认目标和材料；Suno Styles 默认给可直接粘贴的英文，中文说明分开、歌词保留原语言，用户另指定语言时遵从；仅要提示词不查平台，需要保存时再确认目录，素材引用与生成仍需对应授权，不自动学习长期偏好。"

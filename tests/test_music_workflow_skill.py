@@ -17,7 +17,13 @@ from unittest.mock import patch
 
 SKILL = Path(__file__).resolve().parents[1] / "skills" / "ai-music-workflow"
 SCRIPT = SKILL / "scripts" / "project.py"
-DELIVERY_FILES = ("README.md", "SKILL.md", "agents/openai.yaml", "references/suno-workflow.md", "scripts/project.py")
+DELIVERY_FILES = (
+    "README.md", "SKILL.md", "agents/openai.yaml",
+    "references/creative-workflow.md", "references/producer-library.md",
+    "references/suno-feature-guide.md", "references/suno-mcp-map.md",
+    "references/suno-official-sources.md", "references/suno-workflow.md",
+    "scripts/library.py", "scripts/project.py", "scripts/record_io.py",
+)
 LYRICS = "[Verse]\n\u98ce\u5439\u8fc7\u65e7\u8857\n\n[Chorus]\n\u6211\u4eec\u56de\u5bb6\n"
 
 

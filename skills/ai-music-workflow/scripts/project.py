@@ -3,96 +3,50 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-from datetime import datetime, timezone
-import hashlib
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import sys
-import time
 from typing import Any
 from urllib.parse import urlsplit
-import uuid
 import wave
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-MAX_TEXT_BYTES = 2 * 1024 * 1024
-SECRET = re.compile(
-    r"(?i)\b(?:sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9_]{20,}|"
-    r"github_pat_[a-z0-9_]{20,})\b|"
-    r"\b(?:api[_ -]?key|app[_ -]?secret|access[_ -]?token|endpoint[_ -]?id)"
-    r"\s*[:=]\s*\S+"
-)
+def _sibling(name):
+    import importlib.util
+    module_name = "_ai_music_" + name
+    path = Path(__file__).resolve().with_name(name + ".py")
+    cached = sys.modules.get(module_name)
+    if cached is not None and Path(cached.__file__).resolve() == path:
+        return cached
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    result = importlib.util.module_from_spec(spec)
+    # Fixed sibling code only; never write runtime caches into the installed Skill.
+    exec(compile(path.read_bytes(), str(path), "exec"), result.__dict__)
+    sys.modules[module_name] = result
+    return result
 
 
-class ProjectError(ValueError):
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-        self.residual_paths: list[str] = []
-
-
-def _require(condition: bool, code: str, message: str) -> None:
-    if not condition:
-        raise ProjectError(code, message)
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _id() -> str:
-    return str(uuid.uuid4())
-
-
-def _clean(value: str, *, empty: bool = False) -> str:
-    _require(isinstance(value, str), "input", "Expected text.")
-    value = value.replace("\r\n", "\n").replace("\r", "\n")
-    _require(empty or bool(value.strip()), "input", "Text must not be empty.")
-    _require(not SECRET.search(value), "secret", "Potential credential detected; input not stored.")
-    return value
-
-
-def _text(path: Path) -> str:
-    try:
-        _require(path.stat().st_size <= MAX_TEXT_BYTES, "input", "Text file too large.")
-        return _clean(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError) as exc:
-        raise ProjectError("input", "Cannot read UTF-8 input file.") from exc
-
-
-def _json(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(_text(path))
-    except json.JSONDecodeError as exc:
-        raise ProjectError("json", "Invalid JSON file.") from exc
-    _require(isinstance(data, dict), "json", "Expected a JSON object.")
-    return data
+_io = _sibling("record_io")
+ProjectError = _io.RecordError
+MAX_TEXT_BYTES = _io.MAX_TEXT_BYTES
+SECRET = _io.SECRET
+_require, _now, _id = _io.require, _io.now, _io.new_id
+_clean, _text, _json = _io.clean, _io.read_text, _io.read_json
+_path, _digest = _io.inside, _io.digest
+_atomic_move, _write_new = _io.atomic_move, _io.write_new
 
 
 def _root(root: Path) -> Path:
-    root = Path(root).resolve()
+    root = _io.root(root)
     _require(not root.is_relative_to(SKILL_ROOT), "path", "Project must be outside the Skill directory.")
+    _require(not any((parent / "library.json").exists() for parent in (root, *root.parents)),
+             "path", "Project must be outside the producer library.")
     return root
-
-
-def _path(root: Path, relative: str) -> Path:
-    _require(isinstance(relative, str) and bool(relative), "path", "Invalid project path.")
-    rel = Path(relative)
-    _require(not rel.is_absolute() and ".." not in rel.parts and ":" not in relative,
-             "path", "Project paths must stay inside the project.")
-    target = (root / rel).resolve()
-    _require(target != root and target.is_relative_to(root), "path", "Project path escapes its root.")
-    return target
-
-
-def _digest(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _load(root: Path) -> dict[str, Any]:
@@ -141,6 +95,28 @@ def _load(root: Path) -> dict[str, Any]:
             _identities(row["selected_ids"])
     for row in data["archives"]:
         _identities(row["selected_ids"])
+    references = data.get("references", [])
+    _require(isinstance(references, list), "schema", "Invalid reference collection.")
+    seen = set()
+    for row in references:
+        _fields(row, dict(id=str, path=str, sha256=str))
+        _identities([row["id"]])
+        _require(row["id"] not in seen and row["path"] == f"references/{row['id']}.json",
+                 "schema", "Duplicate reference identity or invalid path.")
+        seen.add(row["id"])
+        _path(root, row["path"])
+    for ref_id in [data.get("active_reference_id")] + [b.get("reference_id") for b in data["batches"]]:
+        _require(ref_id is None or (isinstance(ref_id, str) and ref_id in seen),
+                 "schema", "Reference identity is not tracked by this project.")
+    events = data.get("reference_events", [])
+    _require(isinstance(events, list), "schema", "Invalid reference event collection.")
+    for event in events:
+        _fields(event, dict(at=str, action=str, reason=str))
+        _require(set(event) == {"at", "action", "reason", "reference_id"} and event["action"] == "clear",
+                 "schema", "Invalid reference event fields.")
+        ref_id = event["reference_id"]
+        _require(ref_id is None or (isinstance(ref_id, str) and ref_id in seen),
+                 "schema", "Unknown reference in project history.")
     return data
 
 
@@ -173,38 +149,13 @@ def _missing_formats(state: dict[str, Any]) -> dict[str, list[str]]:
     return missing
 
 
-def _atomic_move(source: Path, target: Path, *, replace: bool = False) -> None:
-    operation = os.replace if replace else os.rename
-    # Windows readers can briefly deny rename/delete while allowing ordinary reads.
-    for delay in (0.05, 0.1, 0.2, 0.4, None):
-        try:
-            operation(source, target)
-            return
-        except PermissionError as exc:
-            if sys.platform != "win32" or getattr(exc, "winerror", None) not in (5, 32, 33) or delay is None:
-                raise
-            time.sleep(delay)
-
-
 def _save(root: Path, data: dict[str, Any]) -> None:
     data["updated_at"] = _now()
-    serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    _require(len(serialized.encode("utf-8")) <= MAX_TEXT_BYTES,
-             "size", "Project record limit reached; previous manifest preserved.")
-    target = _path(root, "project.json")
-    temporary = _path(root, ".project-" + _id() + ".tmp")
-    try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _atomic_move(temporary, target, replace=True)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _io.atomic_json(root, "project.json", data)
 
 
 @contextmanager
-def _edit(root: Path, initial: dict[str, Any] | None = None):
+def _project_lock(root: Path):
     lock = _path(root, ".skill-project.lock")
     token = _id()
     try:
@@ -213,9 +164,7 @@ def _edit(root: Path, initial: dict[str, Any] | None = None):
     except FileExistsError as exc:
         raise ProjectError("locked", "Project is locked; verify the existing writer before recovery.") from exc
     try:
-        data = _load(root) if initial is None else initial
-        yield data
-        _save(root, data)
+        yield
     except OSError as exc:
         raise ProjectError("io", "File operation failed; project completion was not recorded.") from exc
     finally:
@@ -223,12 +172,15 @@ def _edit(root: Path, initial: dict[str, Any] | None = None):
             lock.unlink()
 
 
-def _write_new(root: Path, relative: str, text: str) -> Path:
-    path = _path(root, relative)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-    return path
+@contextmanager
+def _edit(root: Path, initial: dict[str, Any] | None = None):
+    with _project_lock(root):
+        data = _load(root) if initial is None else initial
+        yield data
+        _save(root, data)
+
+
+
 
 
 def _find(rows: list[dict[str, Any]], identity: str) -> dict[str, Any]:
@@ -278,8 +230,8 @@ def approve_lyrics(root: Path, lyrics_id: str, approval_file: Path) -> dict[str,
     return row
 
 
-def prepare_batch(root: Path, package_file: Path, authorization_file: Path) -> dict[str, Any]:
-    return _create_batch(root, package_file, authorization_file)
+def prepare_batch(root: Path, package_file: Path, authorization_file: Path, *, library_root=None) -> dict[str, Any]:
+    return _create_batch(root, package_file, authorization_file, library_root=library_root)
 
 
 def import_existing_batch(root: Path, package_file: Path, authorization_file: Path,
@@ -290,7 +242,7 @@ def import_existing_batch(root: Path, package_file: Path, authorization_file: Pa
 
 
 def _create_batch(root: Path, package_file: Path, authorization_file: Path,
-                  observation: dict[str, Any] | None = None) -> dict[str, Any]:
+                  observation: dict[str, Any] | None = None, *, library_root=None) -> dict[str, Any]:
     root, package, authorization = _root(root), _json(package_file), _json(authorization_file)
     _require(set(package) == {"title", "style", "lyrics_id", "lyrics", "instrumental"},
              "package", "Unexpected or missing package fields.")
@@ -303,8 +255,10 @@ def _create_batch(root: Path, package_file: Path, authorization_file: Path,
     _require(type(authorization["max_generation_clicks"]) is int
              and authorization["max_generation_clicks"] == 1,
              "authorization", "One explicitly approved generation click per batch.")
-    with _edit(root) as state:
+    guard = _reference_guard(root, library_root) if observation is None else nullcontext(None)
+    with guard as reference_id, _edit(root) as state:
         if observation is None:
+            _require(state.get("active_reference_id") == reference_id, "changed", "References changed; recheck before preparing.")
             _require(not any(b["submission_status"] in ("prepared", "uncertain") for b in state["batches"]),
                      "pending", "Resolve the existing prepared or uncertain batch before creating another.")
         if package["instrumental"]:
@@ -334,6 +288,8 @@ def _create_batch(root: Path, package_file: Path, authorization_file: Path,
         row = dict(id=identity, lyrics_id=package["lyrics_id"], package_path=relative,
                    package_sha256=_digest(path), authorization=authorization,
                    submission_status="prepared", song_ids=[], evidence=[])
+        if reference_id is not None:
+            row["reference_id"] = reference_id
         if observation is not None:
             row.update(origin="existing_result", submission_status="submitted", song_ids=observation["song_ids"])
             _append_evidence(row, "submitted", observation["evidence"])
@@ -362,10 +318,13 @@ def _append_evidence(row: dict[str, Any], status: str, evidence: str) -> None:
         row["evidence"].append(dict(at=_now(), status=status, text=evidence))
 
 
-def record_submission(root: Path, batch_id: str, observation_file: Path) -> dict[str, Any]:
+def record_submission(root: Path, batch_id: str, observation_file: Path, *, library_root=None) -> dict[str, Any]:
     root, observation = _root(root), _observation(observation_file)
     status, ids, evidence = observation["status"], observation["song_ids"], observation["evidence"]
-    with _edit(root) as state:
+    prior = _find(_load(root)["batches"], batch_id)
+    starting = status == "uncertain" and prior["submission_status"] == "prepared"
+    guard = _reference_guard(root, library_root, batch_id) if starting else nullcontext(None)
+    with guard as reference_id, _edit(root) as state:
         row = _find(state["batches"], batch_id)
         old = row["submission_status"]
         if old == status and row["song_ids"] == ids:
@@ -376,9 +335,104 @@ def record_submission(root: Path, batch_id: str, observation_file: Path) -> dict
         _require(status in allowed.get(old, set()), "state", "Submission cannot transition or be reopened.")
         if status == "uncertain":
             _verify(root, row, "package_path", "package_sha256")
+            _require(row.get("reference_id") == reference_id, "changed", "Batch references changed; recheck before submitting.")
+            _generation_ready(root, state, row)
         row["submission_status"], row["song_ids"] = status, ids
         _append_evidence(row, status, evidence)
     return row
+
+
+def _snapshot(root, state, reference_id):
+    row = _find(state.get("references", []), reference_id)
+    data = _json(_verify(root, row))
+    _fields(data, dict(id=str, created_at=str, selection=dict, permissions=list))
+    _require(data["id"] == reference_id, "integrity", "Reference snapshot identity mismatch.")
+    _sibling("library").selection_shape(data["selection"])
+    return data
+
+
+def attach_references(root, library_root, selection_file):
+    root, selection = _root(root), _json(selection_file)
+    library = _sibling("library")
+    library.disjoint(root, library_root)
+    relative = None
+    try:
+        with library.validated_selection(library_root, selection, "local") as verified, _edit(root) as state:
+            identity = _id()
+            relative = f"references/{identity}.json"
+            data = dict(verified, id=identity, created_at=_now())
+            path = _write_new(root, relative, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            row = dict(id=identity, path=relative, sha256=_digest(path))
+            state.setdefault("references", []).append(row)
+            state["active_reference_id"] = identity
+    except (ProjectError, OSError) as exc:
+        error = exc if isinstance(exc, ProjectError) else ProjectError("io", "Reference save failed; completion not recorded.")
+        if relative is not None:
+            try:
+                if _path(root, relative).exists():
+                    error.residual_paths.append(relative)
+            except (ProjectError, OSError):
+                pass
+        if error is exc:
+            raise
+        raise error from exc
+    return row
+
+
+def clear_references(root, reason_file):
+    root, reason = _root(root), _text(reason_file)
+    with _edit(root) as state:
+        previous = state.get("active_reference_id")
+        state["active_reference_id"] = None
+        state.setdefault("reference_events", []).append(dict(at=_now(), action="clear", reference_id=previous, reason=reason))
+    return dict(active_reference_id=None, previous_reference_id=previous)
+
+
+@contextmanager
+def _reference_guard(root, library_root, batch_id=None):
+    state = _load(root)
+    ref_id = (state.get("active_reference_id") if batch_id is None
+              else _find(state["batches"], batch_id).get("reference_id"))
+    if ref_id is None:
+        yield None
+        return
+    snapshot = _snapshot(root, state, ref_id)
+    _require(library_root is not None, "library", "Current library path is required for referenced generation.")
+    library = _sibling("library")
+    library.disjoint(root, library_root)
+    # Keep the library stable until the project record is checked and saved.
+    with library.validated_selection(library_root, snapshot["selection"], "generation"):
+        yield ref_id
+
+
+def _generation_ready(root, state, batch):
+    _require(batch["submission_status"] == "prepared", "pending", "Only a prepared batch may start generation.")
+    _require(not any(b["id"] != batch["id"] and b["submission_status"] in ("prepared", "uncertain")
+                     for b in state["batches"]), "pending", "Resolve other pending batches first.")
+    _clean(batch["authorization"]["approval"])
+    payload = _json(_verify(root, batch, "package_path", "package_sha256"))
+    _require(set(payload) == {"title", "style", "lyrics_id", "lyrics", "instrumental"}
+             and payload["lyrics_id"] == batch["lyrics_id"]
+             and payload["instrumental"] is (batch["lyrics_id"] is None), "integrity", "Batch package mode changed.")
+    if batch["lyrics_id"] is not None:
+        lyric = _find(state["lyrics"], batch["lyrics_id"])
+        path = _verify(root, lyric)
+        _require(isinstance(lyric["approval"], dict) and lyric["approval"].get("sha256") == lyric["sha256"]
+                 and payload["lyrics"] == _text(path), "approval", "Batch lyrics are no longer verifiably approved.")
+    else:
+        _require(payload["lyrics"] == "", "integrity", "Instrumental package contains lyrics.")
+    if batch.get("reference_id"):
+        _snapshot(root, state, batch["reference_id"])
+
+
+def check_generation(root, batch_id, library_root=None):
+    root = _root(root)
+    with _reference_guard(root, library_root, batch_id) as ref_id, _project_lock(root):
+        state = _load(root)
+        batch = _find(state["batches"], batch_id)
+        _require(batch.get("reference_id") == ref_id, "changed", "Batch reference changed during validation.")
+        _generation_ready(root, state, batch)
+    return dict(ready=True, batch_id=batch_id, reference_id=ref_id, scope="local_preflight_only")
 
 
 def _mp3_frame_size(header: bytes) -> int:
@@ -554,6 +608,17 @@ def archive_project(root: Path) -> dict[str, Any]:
             review += "\n\n## Review notes\n\n" + "\n\n".join(row["notes"] for row in state["reviews"]) + "\n"
             review_path = _write_new(root, temporary_rel + "/review.md", review)
             files.append(dict(path="review.md", sha256=_digest(review_path)))
+            provenance = []
+            for batch_id in sorted({row["batch_id"] for row in selected}):
+                batch = _find(state["batches"], batch_id)
+                if batch.get("reference_id"):
+                    snapshot = _snapshot(root, state, batch["reference_id"])["selection"]
+                    for item in snapshot["items"]:
+                        provenance.append(dict(batch_id=batch_id, library_id=snapshot["library_id"],
+                            **{k: item[k] for k in ("entry_id", "revision", "sha256", "usage")}))
+            if provenance:
+                path = _write_new(root, temporary_rel + "/provenance.json", json.dumps(provenance, ensure_ascii=False, indent=2) + "\n")
+                files.append(dict(path="provenance.json", sha256=_digest(path)))
             _write_new(root, temporary_rel + "/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
             manifest_hash = _digest(temporary / "manifest.json")
             _atomic_move(temporary, final)
@@ -572,7 +637,7 @@ def archive_project(root: Path) -> dict[str, Any]:
     return row
 
 
-def project_status(root: Path) -> dict[str, Any]:
+def project_status(root: Path, *, library_root=None) -> dict[str, Any]:
     root = _root(root)
     state = _load(root)
     problems = []
@@ -608,6 +673,32 @@ def project_status(root: Path) -> dict[str, Any]:
     if problems:
         next_action = "repair_files"
     missing = _missing_formats(state)
+    reference_problems = []
+    reference_status = "none"
+    needed = {b["reference_id"] for b in state["batches"] if b.get("reference_id")
+              and b["submission_status"] in ("prepared", "uncertain")}
+    if state.get("active_reference_id"):
+        needed.add(state["active_reference_id"])
+    for row in state.get("references", []):
+        try:
+            _snapshot(root, state, row["id"])
+        except (ProjectError, OSError):
+            problems.append("reference_missing_or_changed:" + row["id"])
+    if needed:
+        reference_status = "unverified" if library_root is None else "valid"
+        if library_root is not None:
+            for ref_id in sorted(needed):
+                try:
+                    library = _sibling("library")
+                    library.disjoint(root, library_root)
+                    snapshot = _snapshot(root, state, ref_id)
+                    with library.validated_selection(library_root, snapshot["selection"], "generation"):
+                        pass
+                except (ProjectError, OSError) as exc:
+                    reference_status = "invalid"
+                    reference_problems.append(dict(reference_id=ref_id, error=getattr(exc, "code", "io")))
+    if problems:
+        next_action = "repair_files"
     delivery_status = "not_selected"
     if state["final_selection"]:
         delivery_status = "missing_formats" if missing else "ready_to_archive"
@@ -618,6 +709,8 @@ def project_status(root: Path) -> dict[str, Any]:
     if problems:
         delivery_status = "repair_files"
     return dict(project_id=state["project_id"], title=state["title"], problems=problems,
+                reference_status=reference_status, reference_problems=reference_problems,
+                active_reference_id=state.get("active_reference_id"), references=state.get("references", []),
                 next_action=next_action, delivery_status=delivery_status, missing_formats=missing,
                 required_formats=state.get("required_formats", []),
                 lyrics=state["lyrics"], batches=state["batches"], candidates=state["candidates"],
@@ -646,10 +739,15 @@ def main(argv: list[str] | None = None) -> int:
         "add-candidate": [("--batch-id", str), ("--song-id", str), ("--file", Path), ("--source-page", str)],
         "review": [("--decision-file", Path)],
         "archive": [],
+        "attach-references": [("--selection-file", Path)],
+        "clear-references": [("--reason-file", Path)],
+        "check-generation": [("--batch-id", str)],
     }
     for name, arguments in definitions.items():
         command = commands.add_parser(name)
         command.add_argument("--project", required=True, type=Path)
+        if name in ("attach-references", "prepare-batch", "record-submission", "check-generation", "status"):
+            command.add_argument("--library", type=Path, required=name == "attach-references")
         for flag, value_type in arguments:
             command.add_argument(flag, required=True, type=value_type)
     try:
@@ -658,13 +756,16 @@ def main(argv: list[str] | None = None) -> int:
             "init": lambda: init_project(args.project, args.title, args.brief_file),
             "add-lyrics": lambda: add_lyrics(args.project, args.file),
             "approve-lyrics": lambda: approve_lyrics(args.project, args.lyrics_id, args.approval_file),
-            "status": lambda: project_status(args.project),
-            "prepare-batch": lambda: prepare_batch(args.project, args.package_file, args.authorization_file),
+            "status": lambda: project_status(args.project, library_root=args.library),
+            "prepare-batch": lambda: prepare_batch(args.project, args.package_file, args.authorization_file, library_root=args.library),
             "import-existing-batch": lambda: import_existing_batch(args.project, args.package_file, args.authorization_file, args.observation_file),
-            "record-submission": lambda: record_submission(args.project, args.batch_id, args.observation_file),
+            "record-submission": lambda: record_submission(args.project, args.batch_id, args.observation_file, library_root=args.library),
             "add-candidate": lambda: add_candidate(args.project, args.batch_id, args.song_id, args.file, args.source_page),
             "review": lambda: record_review(args.project, args.decision_file),
             "archive": lambda: archive_project(args.project),
+            "attach-references": lambda: attach_references(args.project, args.library, args.selection_file),
+            "clear-references": lambda: clear_references(args.project, args.reason_file),
+            "check-generation": lambda: check_generation(args.project, args.batch_id, args.library),
         }
         print(json.dumps(handlers[args.command](), ensure_ascii=False))
         return 0
